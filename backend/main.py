@@ -5,9 +5,13 @@ Serves ML predictions, model metrics, SHAP explanations, and analysis plots.
 """
 
 import json
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+import joblib
+import sklearn
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +58,93 @@ PLOTS_DIR = BASE_DIR / "plots"
 DATASET_PATH = Path.home() / "Downloads" / "diabetes-dataset (1).csv"
 if not DATASET_PATH.exists():
     DATASET_PATH = BASE_DIR / "diabetes-dataset (1).csv"
+
+
+# ============================================================
+# Model Cache
+# ============================================================
+# Training runs a large GridSearchCV sweep that takes several minutes. The
+# fitted estimators are persisted so subsequent restarts load in ~1 second.
+CACHE_DIR = Path(__file__).resolve().parent / "model_cache"
+CACHE_FILE = CACHE_DIR / "trained_models.joblib"
+
+# Bump when the training pipeline changes in a way that invalidates old caches.
+CACHE_VERSION = 1
+
+
+def _cache_fingerprint():
+    """Identify the inputs a cache entry is only valid for."""
+    try:
+        stat = DATASET_PATH.stat()
+        dataset_sig = [str(DATASET_PATH), int(stat.st_size), int(stat.st_mtime)]
+    except OSError:
+        dataset_sig = None
+
+    return {
+        "cache_version": CACHE_VERSION,
+        "dataset": dataset_sig,
+        # Pickled estimators are not portable across library versions.
+        "sklearn": sklearn.__version__,
+        "numpy": np.__version__,
+    }
+
+
+def _save_cache():
+    """Persist fitted estimators and precomputed payloads to disk."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # The SHAP explainer is rebuilt on load rather than pickled — it is
+        # cheap to construct and avoids brittle cross-version pickles.
+        models_payload = {k: v for k, v in models_store.items() if k != "shap_explainer"}
+        joblib.dump(
+            {
+                "fingerprint": _cache_fingerprint(),
+                "models": models_payload,
+                "data": data_store,
+            },
+            CACHE_FILE,
+            compress=3,
+        )
+        print(f"💾 Model cache written to {CACHE_FILE}")
+    except Exception as exc:
+        # A cache failure must never take the API down.
+        print(f"⚠️  Could not write model cache: {exc}")
+
+
+def _load_cache():
+    """Restore a previous training run. Returns True when the cache was used."""
+    if os.environ.get("DIAPREDICT_FORCE_RETRAIN"):
+        print("♻️  DIAPREDICT_FORCE_RETRAIN set — retraining from scratch.")
+        return False
+
+    if not CACHE_FILE.exists():
+        return False
+
+    try:
+        payload = joblib.load(CACHE_FILE)
+    except Exception as exc:
+        print(f"⚠️  Ignoring unreadable model cache: {exc}")
+        return False
+
+    if payload.get("fingerprint") != _cache_fingerprint():
+        print("♻️  Dataset or library versions changed — retraining.")
+        return False
+
+    try:
+        models_store.update(payload["models"])
+        data_store.update(payload["data"])
+        # Rebuild the explainer from the restored Random Forest.
+        models_store["shap_explainer"] = shap.TreeExplainer(
+            models_store["random_forest"].best_estimator_
+        )
+    except Exception as exc:
+        print(f"⚠️  Model cache incomplete ({exc}) — retraining.")
+        models_store.clear()
+        data_store.clear()
+        return False
+
+    print(f"⚡ Loaded trained models from cache ({CACHE_FILE.name}) — skipped retraining.")
+    return True
 
 
 # ============================================================
@@ -276,6 +367,7 @@ def train_all_models():
     }
 
     print("✅ All models trained and ready!")
+    _save_cache()
 
 
 # ============================================================
@@ -283,7 +375,8 @@ def train_all_models():
 # ============================================================
 @app.on_event("startup")
 async def startup_event():
-    train_all_models()
+    if not _load_cache():
+        train_all_models()
 
 
 # ============================================================
@@ -292,7 +385,15 @@ async def startup_event():
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "models_loaded": len(models_store) > 0}
+    return {
+        "status": "ok",
+        "models_loaded": len(models_store) > 0,
+        "cache": {
+            "enabled": True,
+            "present": CACHE_FILE.exists(),
+            "path": str(CACHE_FILE),
+        },
+    }
 
 
 @app.get("/api/dataset-info")

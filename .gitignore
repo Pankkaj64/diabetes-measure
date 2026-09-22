@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Trained model cache (regenerated on first run)
+backend/model_cache/
